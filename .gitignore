@@ -1,0 +1,25 @@
+# ===== Build artifacts =====
+*.exe
+*.out
+*.o
+*.obj
+bin/
+build/
+
+# ===== VS Code =====
+.vscode/
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# ===== Logs =====
+*.log
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+
+# ===== CMake (if you add later) =====
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
