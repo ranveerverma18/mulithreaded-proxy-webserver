@@ -8,3 +8,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(proxy_server
     src/main.cpp
 )
+
+target_link_libraries(proxy_server ws2_32)
+
