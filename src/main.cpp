@@ -183,6 +183,36 @@ if (request.empty()) {
     closesocket(clientSocket);
 }
 
+constexpr int THREAD_POOL_SIZE = 8;
+
+std::queue<SOCKET> taskQueue;
+std::mutex queueMutex;
+std::condition_variable queueCV;
+bool shutdownPool = false;
+
+void workerThread() {
+    while (true) {
+        SOCKET clientSocket;
+
+        {
+            unique_lock<mutex> lock(queueMutex);
+            queueCV.wait(lock, [] {
+                return !taskQueue.empty() || shutdownPool;
+            });
+
+            if (shutdownPool && taskQueue.empty()) {
+                return; // exit thread
+            }
+
+            clientSocket = taskQueue.front();
+            taskQueue.pop();
+        }
+
+        handleClient(clientSocket);
+    }
+}
+
+
 int main() {
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -212,6 +242,12 @@ int main() {
     listen(serverSocket, SOMAXCONN);
     cout << "Multithreaded proxy listening on port 9090...\n";
 
+    vector<thread> workers;
+
+    for (int i = 0; i < THREAD_POOL_SIZE; ++i) {
+    workers.emplace_back(workerThread);
+   }
+
     //loop to accept clients 
     while (true) {
         SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
@@ -219,9 +255,19 @@ int main() {
             cerr << "Accept failed\n";
             continue;
         }
+       
+        {
+        lock_guard<mutex> lock(queueMutex);
+        taskQueue.push(clientSocket);
+    }
+    queueCV.notify_one();
+    }
+    
+    shutdownPool = true;
+    queueCV.notify_all();
 
-        // Spawn a thread per client(1 thread 1 client) to handle and then detach it to run independently
-        thread(handleClient, clientSocket).detach();
+    for (auto& t : workers) {
+    t.join();
     }
 
     closesocket(serverSocket);
