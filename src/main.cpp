@@ -6,6 +6,11 @@ using namespace std;
 #pragma comment(lib, "ws2_32.lib")
 
 constexpr int BUFFER_SIZE = 8192;
+constexpr int THREAD_POOL_SIZE = 8;
+constexpr size_t MAX_QUEUE_SIZE = 100;
+constexpr int CLIENT_TIMEOUT_MS = 5000;   // 5s
+constexpr int REMOTE_TIMEOUT_MS = 5000;   // 5s
+
 //using cerr for error messages and cout for normal msgs
 string extractHost(const std::string& request) {
     size_t pos = request.find("Host:");
@@ -53,7 +58,7 @@ string normalizeRequest(const std::string& request, const std::string& host) {
 
 string buildForwardRequest(const string& request,
                                 const string& host) {
-    size_t lineEnd = request.find("\r\n");
+    size_t lineEnd = request.find("\r\n");    // \r\n is the standard pattern used in netwroking to indicate eol in HTTP headers, so we can use it to find the end of the request line
     if (lineEnd == string::npos) return request;
 
     // ---- Request line ----
@@ -116,22 +121,44 @@ string buildForwardRequest(const string& request,
 }
 
 
+void setSocketTimeouts(SOCKET sock, int timeoutMs) {
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,                      //RCVTIMEO for recv timeout(flag for input operations)
+               (const char*)&timeoutMs, sizeof(timeoutMs));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,                      //SNDTIMEO for send timeout(flag for output operations)
+               (const char*)&timeoutMs, sizeof(timeoutMs));
+}
+
+
 // This function runs INSIDE A THREAD
 void handleClient(SOCKET clientSocket) {
+    setSocketTimeouts(clientSocket, CLIENT_TIMEOUT_MS);   // Set timeouts for client socket  //if client doesn't send data within 5s, recv will return with error and we can close the connection to free resources
     string request;
     char buffer[BUFFER_SIZE];
-
-    while (true) {
+while (true) {
     int bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE, 0);
-    if (bytesReceived <= 0) {
-        break;
+
+    if (bytesReceived > 0) {
+        request.append(buffer, bytesReceived);
+
+        // Stop once HTTP headers are fully received
+        if (request.find("\r\n\r\n") != std::string::npos) {
+            break;
+        }
     }
-
-    request.append(buffer, bytesReceived);
-
-    // Stop once HTTP headers are fully received
-    if (request.find("\r\n\r\n") != string::npos) {
-        break;
+    else if (bytesReceived == 0) {
+        // Client closed connection before sending full request
+        closesocket(clientSocket);
+        return;
+    }
+    else {
+        int err = WSAGetLastError();
+        if (err == WSAETIMEDOUT) {
+            cerr << "[Timeout] Client recv timed out (Slowloris protection)\n";
+        } else {
+            cerr << "[Error] Client recv failed: " << err << "\n";
+        }
+        closesocket(clientSocket);
+        return;
     }
 }
 
@@ -158,14 +185,21 @@ if (request.empty()) {
     }
 
     SOCKET remoteSocket = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (connect(remoteSocket, res->ai_addr, res->ai_addrlen) == SOCKET_ERROR) {
-        cerr << "[Thread " << this_thread::get_id()
-          << "] Remote connection failed to host: " << host << "\n";
+    setSocketTimeouts(remoteSocket, REMOTE_TIMEOUT_MS);   // Set timeouts for remote socket
+    bool connected = false;
+    for(int attempt=0;attempt<2;attempt++)
+    {
+        if(connect(remoteSocket, res->ai_addr, res->ai_addrlen) == 0) {
+            connected = true;
+            break;
+        }
+    }
+    if(!connected) {
         freeaddrinfo(res);
+        closesocket(remoteSocket);
         closesocket(clientSocket);
         return;
     }
-
     freeaddrinfo(res);
 
     // Forward request
@@ -183,17 +217,14 @@ if (request.empty()) {
     closesocket(clientSocket);
 }
 
-constexpr int THREAD_POOL_SIZE = 8;
-
-std::queue<SOCKET> taskQueue;
-std::mutex queueMutex;
-std::condition_variable queueCV;
+queue<SOCKET> taskQueue;
+mutex queueMutex;
+condition_variable queueCV;
 bool shutdownPool = false;
 
 void workerThread() {
     while (true) {
         SOCKET clientSocket;
-
         {
             unique_lock<mutex> lock(queueMutex);
             queueCV.wait(lock, [] {
@@ -210,6 +241,18 @@ void workerThread() {
 
         handleClient(clientSocket);
     }
+}
+
+void sendServiceUnavailable(SOCKET clientSocket) {
+    const char* response =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: text/plain\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Server overloaded. Please try again later.\n";
+
+    send(clientSocket, response, strlen(response), 0);
+    closesocket(clientSocket);
 }
 
 
@@ -250,25 +293,29 @@ int main() {
 
     //loop to accept clients 
     while (true) {
-        SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
-        if (clientSocket == INVALID_SOCKET) {
-            cerr << "Accept failed\n";
-            continue;
-        }
-       
-        {
-        lock_guard<mutex> lock(queueMutex);
-        taskQueue.push(clientSocket);
+    SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
+    if (clientSocket == INVALID_SOCKET) {
+        cerr << "Accept failed\n";
+        continue;
     }
-    queueCV.notify_one();
-    }
-    
-    shutdownPool = true;
-    queueCV.notify_all();
 
-    for (auto& t : workers) {
-    t.join();
+    bool queued = false;
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        if (taskQueue.size() < MAX_QUEUE_SIZE) {
+            taskQueue.push(clientSocket);
+            queued = true;
+        }
     }
+
+    if (queued) {
+        queueCV.notify_one();
+    } else {
+        // Backpressure: reject client
+        sendServiceUnavailable(clientSocket);
+    }
+}
 
     closesocket(serverSocket);
     WSACleanup();
