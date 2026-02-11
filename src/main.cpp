@@ -173,6 +173,157 @@ void sendAll(SOCKET sock, const std::string& data) {
 }
 
 
+void handleConnect(SOCKET clientSocket, const string& request) {
+    // Extract host and port from CONNECT request
+    // Format: CONNECT example.com:443 HTTP/1.1
+    
+    size_t methodEnd = request.find(' ');
+    if (methodEnd == string::npos) {
+        closesocket(clientSocket);
+        return;
+    }
+    
+    size_t hostStart = methodEnd + 1;
+    size_t hostEnd = request.find(' ', hostStart);
+    if (hostEnd == string::npos) {
+        closesocket(clientSocket);
+        return;
+    }
+    
+    string hostPort = request.substr(hostStart, hostEnd - hostStart);
+    
+    // Parse host:port
+    size_t colonPos = hostPort.find(':');
+    string host;
+    string port = "443"; // default HTTPS port
+    
+    if (colonPos != string::npos) {
+        host = hostPort.substr(0, colonPos);
+        port = hostPort.substr(colonPos + 1);
+    } else {
+        host = hostPort;
+    }
+    
+    cout << "[CONNECT] Tunneling to " << host << ":" << port << endl;
+    
+    // Resolve and connect to remote server
+    addrinfo hints{}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) {
+        cerr << "[CONNECT] DNS resolution failed for " << host << endl;
+        const char* errorResponse = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(clientSocket, errorResponse, strlen(errorResponse), 0);
+        closesocket(clientSocket);
+        return;
+    }
+    
+    SOCKET remoteSocket = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (remoteSocket == INVALID_SOCKET) {
+        cerr << "[CONNECT] Socket creation failed\n";
+        freeaddrinfo(res);
+        const char* errorResponse = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(clientSocket, errorResponse, strlen(errorResponse), 0);
+        closesocket(clientSocket);
+        return;
+    }
+    
+    // Set timeouts for remote socket
+    setSocketTimeouts(remoteSocket, REMOTE_TIMEOUT_MS);
+    
+    // Connect to remote server
+    if (connect(remoteSocket, res->ai_addr, res->ai_addrlen) != 0) {
+        cerr << "[CONNECT] Connection failed to " << host << ":" << port << endl;
+        freeaddrinfo(res);
+        closesocket(remoteSocket);
+        const char* errorResponse = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(clientSocket, errorResponse, strlen(errorResponse), 0);
+        closesocket(clientSocket);
+        return;
+    }
+    
+    freeaddrinfo(res);
+    
+    // Send success response to client
+    const char* successResponse = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    send(clientSocket, successResponse, strlen(successResponse), 0);
+    
+    cout << "[CONNECT] Tunnel established to " << host << ":" << port << endl;
+    
+    // Now relay data bidirectionally (encrypted SSL/TLS tunnel)
+    // We use non-blocking sockets and select() for bidirectional relay
+    
+    // Set sockets to non-blocking mode
+    u_long mode = 1;
+    ioctlsocket(clientSocket, FIONBIO, &mode);
+    ioctlsocket(remoteSocket, FIONBIO, &mode);
+    
+    char buffer[BUFFER_SIZE];
+    fd_set readfds;
+    
+    while (true) {
+        FD_ZERO(&readfds);
+        FD_SET(clientSocket, &readfds);
+        FD_SET(remoteSocket, &readfds);
+        
+        // Set timeout for select
+        timeval timeout;
+        timeout.tv_sec = 60;  // 60 second timeout
+        timeout.tv_usec = 0;
+        
+        SOCKET maxfd = (clientSocket > remoteSocket) ? clientSocket : remoteSocket;
+        int activity = select(maxfd + 1, &readfds, nullptr, nullptr, &timeout);
+        
+        if (activity < 0) {
+            cerr << "[CONNECT] Select error\n";
+            break;
+        }
+        
+        if (activity == 0) {
+            // Timeout - connection idle too long
+            cout << "[CONNECT] Tunnel timeout for " << host << endl;
+            break;
+        }
+        
+        // Data from client -> remote server
+        if (FD_ISSET(clientSocket, &readfds)) {
+            int bytesRead = recv(clientSocket, buffer, BUFFER_SIZE, 0);
+            if (bytesRead <= 0) {
+                // Client closed connection
+                cout << "[CONNECT] Client closed tunnel to " << host << endl;
+                break;
+            }
+            
+            int bytesSent = send(remoteSocket, buffer, bytesRead, 0);
+            if (bytesSent <= 0) {
+                cerr << "[CONNECT] Failed to send to remote\n";
+                break;
+            }
+        }
+        
+        // Data from remote server -> client
+        if (FD_ISSET(remoteSocket, &readfds)) {
+            int bytesRead = recv(remoteSocket, buffer, BUFFER_SIZE, 0);
+            if (bytesRead <= 0) {
+                // Remote server closed connection
+                cout << "[CONNECT] Remote closed tunnel to " << host << endl;
+                break;
+            }
+            
+            int bytesSent = send(clientSocket, buffer, bytesRead, 0);
+            if (bytesSent <= 0) {
+                cerr << "[CONNECT] Failed to send to client\n";
+                break;
+            }
+        }
+    }
+    
+    closesocket(remoteSocket);
+    closesocket(clientSocket);
+}
+
+
 // This function runs INSIDE A THREAD
 void handleClient(SOCKET clientSocket) {
     setSocketTimeouts(clientSocket, CLIENT_TIMEOUT_MS);   // Set timeouts for client socket  //if client doesn't send data within 5s, recv will return with error and we can close the connection to free resources
@@ -210,9 +361,17 @@ if (request.empty()) {
     closesocket(clientSocket);
     return;
 }
-    string host = extractHost(request);
+    
     string method = extractMethod(request);
+
+    // Handle CONNECT method separately for HTTPS tunneling
+    if (method == "CONNECT") {
+        handleConnect(clientSocket, request);
+        return;  // handleConnect() closes sockets
+    }
+
     string path = extractpath(request);
+    string host = extractHost(request);
 
     if (host.empty()) {
         cerr << "No Host header found\n";
@@ -244,9 +403,9 @@ if (request.empty()) {
     }
     
     //this part runs if cache miss
-    addrinfo hints{}, *res;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+    addrinfo hints{}, *res;      // Resolve hostname to IP address 
+    hints.ai_family = AF_INET;   //IPv4
+    hints.ai_socktype = SOCK_STREAM;  //TCP
 
     if (getaddrinfo(host.c_str(), "80", &hints, &res) != 0) {
         cerr << "DNS resolution failed\n";
@@ -289,16 +448,20 @@ if (request.empty()) {
         string cacheKey = host + path;
 
         lock_guard<mutex> lock(cacheMutex);
-
+        
+        //checking if the response can fit in the cache
         while (currentCacheSize + fullResponse.size() > MAX_CACHE_SIZE) {
-        string lruKey = lrulist.back();
+        string lruKey = lrulist.back();           //oldest item which is at the very back
         currentCacheSize -= cache[lruKey].first.size;
-        lrulist.pop_back();
-        cache.erase(lruKey);
+        lrulist.pop_back();     //remove from the lru list
+        cache.erase(lruKey);    //remove from cache
     }
-
+    
+    //adding to the front of the lru list as it's the most recently used item now
     lrulist.push_front(cacheKey);
+    
 
+    //inserting into cache
     cache[cacheKey] = make_pair(
         CacheEntry{
             fullResponse,
