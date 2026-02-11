@@ -10,8 +10,38 @@ constexpr int THREAD_POOL_SIZE = 8;
 constexpr size_t MAX_QUEUE_SIZE = 100;
 constexpr int CLIENT_TIMEOUT_MS = 5000;   // 5s
 constexpr int REMOTE_TIMEOUT_MS = 5000;   // 5s
+constexpr size_t MAX_CACHE_SIZE=10*1024*1024; // 10MB
+
+struct CacheEntry {
+    string response;
+    time_t timestamp;
+    size_t size;
+};
+
+list<string>lrulist;
+unordered_map<string,pair<CacheEntry, list<string>::iterator>> cache;
+
+size_t currentCacheSize = 0;
+mutex cacheMutex;
 
 //using cerr for error messages and cout for normal msgs
+string extractMethod(const std::string& request) {
+    size_t end = request.find(' ');
+    if (end == string::npos) return "";
+    return request.substr(0, end);
+}
+
+string extractpath(const string& request)
+{
+    size_t methodEnd=request.find(' ');
+    if(methodEnd==string::npos) return "";
+
+    size_t pathEnd=request.find(' ',methodEnd+1);
+    if(pathEnd==string::npos) return "";
+
+    return request.substr(methodEnd+1,pathEnd-methodEnd-1);
+}
+
 string extractHost(const std::string& request) {
     size_t pos = request.find("Host:");
     if (pos == string::npos) return "";
@@ -23,6 +53,7 @@ string extractHost(const std::string& request) {
     size_t end = request.find("\r\n", start);
     return request.substr(start, end - start);
 }
+
 
 string normalizeRequest(const std::string& request, const std::string& host) {
     size_t lineEnd = request.find("\r\n");
@@ -128,6 +159,19 @@ void setSocketTimeouts(SOCKET sock, int timeoutMs) {
                (const char*)&timeoutMs, sizeof(timeoutMs));
 }
 
+void sendAll(SOCKET sock, const std::string& data) {
+    int totalSent = 0;
+    int length = data.size();
+
+    while (totalSent < length) {
+        int sent = send(sock, data.data() + totalSent, length - totalSent, 0);
+        if (sent == SOCKET_ERROR) {
+            return;
+        }
+        totalSent += sent;
+    }
+}
+
 
 // This function runs INSIDE A THREAD
 void handleClient(SOCKET clientSocket) {
@@ -167,13 +211,39 @@ if (request.empty()) {
     return;
 }
     string host = extractHost(request);
+    string method = extractMethod(request);
+    string path = extractpath(request);
 
     if (host.empty()) {
         cerr << "No Host header found\n";
         closesocket(clientSocket);
         return;
     }
+    
+    //CACHE LOOKUP
+    if (method == "GET") {
+        string cacheKey = host + path;
 
+        {
+            lock_guard<std::mutex> lock(cacheMutex);
+            auto it = cache.find(cacheKey);
+            if (it != cache.end()) {
+                cout<<"[Cache Hit] " << cacheKey << "\n";
+                // LRU update
+                lrulist.erase(it->second.second);
+                lrulist.push_front(cacheKey);
+                it->second.second = lrulist.begin();
+
+                // Send cached response
+                sendAll(clientSocket, it->second.first.response);
+                closesocket(clientSocket);
+                return;
+            }
+            cout<<"[Cache Miss] " << cacheKey << "\n";
+        }
+    }
+    
+    //this part runs if cache miss
     addrinfo hints{}, *res;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -209,8 +279,36 @@ if (request.empty()) {
 
     // Relay response
     int bytesRead;
+    string fullResponse;
     while ((bytesRead = recv(remoteSocket, buffer, BUFFER_SIZE, 0)) > 0) {
         send(clientSocket, buffer, bytesRead, 0);
+        fullResponse.append(buffer, bytesRead);
+    }
+
+    if (method == "GET" && fullResponse.find("200 OK") != string::npos) {
+        string cacheKey = host + path;
+
+        lock_guard<mutex> lock(cacheMutex);
+
+        while (currentCacheSize + fullResponse.size() > MAX_CACHE_SIZE) {
+        string lruKey = lrulist.back();
+        currentCacheSize -= cache[lruKey].first.size;
+        lrulist.pop_back();
+        cache.erase(lruKey);
+    }
+
+    lrulist.push_front(cacheKey);
+
+    cache[cacheKey] = make_pair(
+        CacheEntry{
+            fullResponse,
+            time(nullptr),              // timestamp
+            fullResponse.size()          // size
+        },
+        lrulist.begin()
+    );
+
+    currentCacheSize += fullResponse.size();
     }
 
     closesocket(remoteSocket);
