@@ -11,6 +11,14 @@ constexpr size_t MAX_QUEUE_SIZE = 100;
 constexpr int CLIENT_TIMEOUT_MS = 5000;   // 5s
 constexpr int REMOTE_TIMEOUT_MS = 5000;   // 5s
 constexpr size_t MAX_CACHE_SIZE=10*1024*1024; // 10MB
+atomic<bool> shutdownRequested(false);
+atomic<int> activeConnections(0);
+
+// Task queue and synchronization primitives for worker threads
+queue<SOCKET> taskQueue;
+mutex queueMutex;
+condition_variable queueCV;
+bool shutdownPool = false;
 
 struct CacheEntry {
     string response;
@@ -23,6 +31,36 @@ unordered_map<string,pair<CacheEntry, list<string>::iterator>> cache;
 
 size_t currentCacheSize = 0;
 mutex cacheMutex;
+
+// Control command handler (for admin interface)
+string handleControlCommand(const string& cmd) {
+    if (cmd == "STATS") {
+        lock_guard<mutex> lock(cacheMutex);
+
+        return "{\n"
+               "  \"active_connections\": " + to_string(activeConnections.load()) + ",\n"
+               "  \"cache_entries\": " + to_string(cache.size()) + ",\n"
+               "  \"cache_size_bytes\": " + to_string(currentCacheSize) + "\n"
+               "}\n";
+    }
+
+    if (cmd == "CLEAR_CACHE") {
+        lock_guard<mutex> lock(cacheMutex);
+        cache.clear();
+        lrulist.clear();
+        currentCacheSize = 0;
+        return "OK: cache cleared\n";
+    }
+
+    if (cmd == "SHUTDOWN") {
+        shutdownRequested = true;
+        shutdownPool = true;
+        queueCV.notify_all();
+        return "OK: shutting down\n";
+    }
+
+    return "ERROR: unknown command\n";
+}
 
 //using cerr for error messages and cout for normal msgs
 string extractMethod(const std::string& request) {
@@ -478,10 +516,44 @@ if (request.empty()) {
     closesocket(clientSocket);
 }
 
-queue<SOCKET> taskQueue;
-mutex queueMutex;
-condition_variable queueCV;
-bool shutdownPool = false;
+// Control server for admin commands (runs in separate thread)
+void controlServer() {
+    SOCKET server = socket(AF_INET, SOCK_STREAM, 0);
+    if (server == INVALID_SOCKET) {
+        cerr << "[Control] Socket creation failed\n";
+        return;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(7070);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    if (bind(server, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        cerr << "[Control] Bind failed\n";
+        closesocket(server);
+        return;
+    }
+
+    listen(server, 5);
+    cout << "[Control] Listening on 127.0.0.1:7070\n";
+
+    while (!shutdownRequested) {
+        SOCKET client = accept(server, nullptr, nullptr);
+        if (client == INVALID_SOCKET) continue;
+
+        char buffer[1024]{};
+        int n = recv(client, buffer, sizeof(buffer) - 1, 0);
+        if (n > 0) {
+            string cmd(buffer);
+            cmd.erase(cmd.find_last_not_of("\r\n") + 1); // trim newline
+            string response = handleControlCommand(cmd);
+            send(client, response.c_str(), response.size(), 0);
+        }
+        closesocket(client);
+    }
+    closesocket(server);
+}
 
 void workerThread() {
     while (true) {
@@ -551,6 +623,9 @@ int main() {
     for (int i = 0; i < THREAD_POOL_SIZE; ++i) {
     workers.emplace_back(workerThread);
    }
+   
+   // Start control server thread
+   thread controlThread(controlServer);
 
     //loop to accept clients 
     while (true) {
@@ -578,6 +653,7 @@ int main() {
     }
 }
 
+    controlThread.join();
     closesocket(serverSocket);
     WSACleanup();
     return 0;
