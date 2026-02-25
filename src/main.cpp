@@ -299,6 +299,8 @@ void handleConnect(SOCKET clientSocket, const string& request) {
     
     char buffer[BUFFER_SIZE];
     fd_set readfds;
+    int idleCount = 0;
+    const int MAX_IDLE_PERIODS = 12;  // 12 x 5 seconds = 60 seconds total idle timeout
     
     while (true) {
         FD_ZERO(&readfds);
@@ -307,7 +309,7 @@ void handleConnect(SOCKET clientSocket, const string& request) {
         
         // Set timeout for select
         timeval timeout;
-        timeout.tv_sec = 60;  // 60 second timeout
+        timeout.tv_sec = 5;   // ← CHANGED: Check every 5 seconds instead of 60
         timeout.tv_usec = 0;
         
         SOCKET maxfd = (clientSocket > remoteSocket) ? clientSocket : remoteSocket;
@@ -319,10 +321,19 @@ void handleConnect(SOCKET clientSocket, const string& request) {
         }
         
         if (activity == 0) {
-            // Timeout - connection idle too long
-            cout << "[CONNECT] Tunnel timeout for " << host << endl;
-            break;
+            // ← CHANGED: Don't close immediately on timeout!
+            // Timeout - no activity, but keep checking
+            idleCount++;
+            if (idleCount >= MAX_IDLE_PERIODS) {
+                // Only close after 60 seconds of TRUE inactivity
+                cout << "[CONNECT] Tunnel idle timeout for " << host << endl;
+                break;
+            }
+            continue;  // ← CHANGED: Keep checking instead of breaking
         }
+        
+        // Reset idle counter when there's activity
+        idleCount = 0;  // ← ADDED: Reset counter on any activity
         
         // Data from client -> remote server
         if (FD_ISSET(clientSocket, &readfds)) {
@@ -477,10 +488,39 @@ if (request.empty()) {
     // Relay response
     int bytesRead;
     string fullResponse;
-    while ((bytesRead = recv(remoteSocket, buffer, BUFFER_SIZE, 0)) > 0) {
-        send(clientSocket, buffer, bytesRead, 0);
-        fullResponse.append(buffer, bytesRead);
-    }
+    while (fullResponse.find("\r\n\r\n") == string::npos) {
+    bytesRead = recv(remoteSocket, buffer, BUFFER_SIZE, 0);
+    if (bytesRead <= 0) break;
+    fullResponse.append(buffer, bytesRead);
+}
+
+size_t headerEnd = fullResponse.find("\r\n\r\n") + 4;
+send(clientSocket, fullResponse.c_str(), headerEnd, 0);
+
+// STEP 2: extract Content-Length
+size_t pos = fullResponse.find("Content-Length:");
+int contentLength = -1;
+
+if (pos != string::npos) {
+    contentLength = stoi(fullResponse.substr(pos + 15));
+}
+
+// STEP 3: read body only till Content-Length
+int bodyReceived = fullResponse.size() - headerEnd;
+
+while (contentLength > 0 && bodyReceived < contentLength) {
+    bytesRead = recv(remoteSocket, buffer, BUFFER_SIZE, 0);
+    if (bytesRead <= 0) break;
+    fullResponse.append(buffer, bytesRead);
+    bodyReceived += bytesRead;
+}
+
+// STEP 4: send response to client
+// SEND BODY ONLY
+send(clientSocket,
+     fullResponse.c_str() + headerEnd,
+     fullResponse.size() - headerEnd,
+     0);
 
     if (method == "GET" && fullResponse.find("200 OK") != string::npos) {
         string cacheKey = host + path;
@@ -556,6 +596,9 @@ void controlServer() {
 }
 
 void workerThread() {
+    thread::id this_id = this_thread::get_id();
+    cout << "[WORKER] Thread " << this_id << " started" << endl;
+    
     while (true) {
         SOCKET clientSocket;
         {
@@ -565,16 +608,20 @@ void workerThread() {
             });
 
             if (shutdownPool && taskQueue.empty()) {
-                return; // exit thread
+                cout << "[WORKER] Thread " << this_id << " shutting down" << endl;
+                return;
             }
 
             clientSocket = taskQueue.front();
             taskQueue.pop();
         }
 
+        cout << "[WORKER] Thread " << this_id << " handling request" << endl;
         handleClient(clientSocket);
+        cout << "[WORKER] Thread " << this_id << " finished, back to queue" << endl;
     }
 }
+
 
 void sendServiceUnavailable(SOCKET clientSocket) {
     const char* response =
@@ -658,6 +705,5 @@ int main() {
     WSACleanup();
     return 0;
 }
-
 
 
